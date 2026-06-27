@@ -34,6 +34,7 @@ CRGB leds2[NUM_LEDS_PER_STRIP]; // Color data storage array for LEDs
 #define MIC_SAMPLE_SHIFT 20
 
 I2SClass i2sMic;
+bool i2sReady = false;
 
 enum VisualMode : uint8_t {
   MODE_SPLIT = 0, // Left strip = bass, right strip = treble
@@ -51,15 +52,21 @@ struct AppState {
   VisualMode mode = MODE_SPLIT;
   ColorEffect effect = EFFECT_RAINBOW;
   bool animateEffect = true;
-  uint8_t brightnessPct = 25;  // default 25/100
+  uint8_t brightnessPct = 20;  // default 20/100 for safer startup power
   uint8_t sensitivityPct = 50; // default mic sensitivity
 };
 
 AppState state;
 unsigned long lastFrameMs = 0;
 unsigned long lastLoopMs = 0;
+unsigned long bootStartMs = 0;
 const unsigned long LOOP_WARN_MS = 200; // warn if a loop iteration is slower than this
 const uint32_t WDT_TIMEOUT_S = 5;       // hardware watchdog reboots if loop hangs this long
+const uint8_t LED_SUPPLY_VOLTS = 5;
+const uint16_t LED_MAX_MILLIAMPS = 350; // stricter cap for unstable USB power
+const uint8_t MAX_BRIGHTNESS_PCT = 40;  // hard ceiling to avoid current spikes
+const unsigned long BOOT_STABILIZE_MS = 4000;
+const unsigned long STRIP2_ENABLE_DELAY_MS = 8000;
 uint8_t hueBase = 0;
 float bassEnergy = 0.0f;
 float trebleEnergy = 0.0f;
@@ -91,20 +98,20 @@ const char* WEB_UI = R"rawliteral(
 <body>
   <div class="wrap">
     <div class="card">
-      <h1>ESP32 LED Nhay Theo Nhac</h1>
-      <div class="sub">AP: LED Nhay Theo Nhac | IP: 192.168.4.1</div>
+      <h1>ESP32 LED Nháy Theo Nhạc</h1>
+      <div class="sub">AP: LED Nháy Theo Nhạc | IP: 192.168.4.1</div>
       <div class="pill" id="modeBadge"></div>
       <div class="pill" id="effectBadge"></div>
     </div>
 
     <div class="card">
-      <label>Che do hien thi</label>
+      <label>Chế độ hiển thị</label>
       <select id="mode">
-        <option value="split">Bass/Treble (Trai: bass, Phai: treble)</option>
-        <option value="sync">Dong bo (hai day giong nhau)</option>
+        <option value="split">Bass/Treble (Trái: bass, Phải: treble)</option>
+        <option value="sync">Đồng bộ (2 Dây giống nhau)</option>
       </select>
 
-      <label>Hieu ung mau</label>
+      <label>Hiệu ứng màu</label>
       <select id="effect">
         <option value="rainbow">Rainbow</option>
         <option value="solid">Solid</option>
@@ -112,25 +119,25 @@ const char* WEB_UI = R"rawliteral(
         <option value="fire">Fire</option>
       </select>
 
-      <label>Doi hieu ung dong</label>
+      <label>Thay đổi hiệu ứng tự động</label>
       <select id="animate">
-        <option value="1">Co</option>
-        <option value="0">Khong</option>
+        <option value="1">Có</option>
+        <option value="0">Không</option>
       </select>
 
       <div class="row">
         <div>
-          <label>Do sang LED: <span id="brightnessValue">25</span>/100</label>
-          <input id="brightness" type="range" min="1" max="100" value="25">
+          <label>Độ sáng LED: <span id="brightnessValue">20</span>/100</label>
+          <input id="brightness" type="range" min="1" max="40" value="20">
         </div>
         <div>
-          <label>Do nhay mic: <span id="sensitivityValue">50</span>/100</label>
+          <label>Độ nhạy mic: <span id="sensitivityValue">50</span>/100</label>
           <input id="sensitivity" type="range" min="1" max="100" value="50">
         </div>
       </div>
 
-      <button class="btn" id="applyBtn">Ap dung</button>
-      <div class="status" id="status">San sang.</div>
+      <button class="btn" id="applyBtn">Áp dụng thay đổi</button>
+      <div class="status" id="status">Sẵn sàng.</div>
     </div>
   </div>
 
@@ -169,7 +176,7 @@ const char* WEB_UI = R"rawliteral(
     }
 
     async function applyState() {
-      status.textContent = 'Dang cap nhat...';
+      status.textContent = 'Đang cập nhật...';
       const q = new URLSearchParams({
         mode: mode.value,
         effect: effect.value,
@@ -187,28 +194,30 @@ const char* WEB_UI = R"rawliteral(
     mode.onchange = drawBadges;
     effect.onchange = drawBadges;
     animate.onchange = drawBadges;
-    loadState().catch(() => status.textContent = 'Khong tai duoc trang thai.');
+    loadState().catch(() => status.textContent = 'Không tải được trạng thái.');
   </script>
 </body>
 </html>
 )rawliteral";
 
 int readMicEnvelope() {
+  if (!i2sReady) return 0;
+
   // Average the rectified amplitude of a short burst of I2S samples. The INMP441
   // is already centered on zero, so no DC offset removal is needed (unlike the
   // old ADC mic that was centered on 2048).
-  long sum = 0;
+  int64_t sum = 0;
   int collected = 0;
   const int samples = 32;
   for (int i = 0; i < samples; i++) {
-    const int raw = i2sMic.read(); // full 32-bit sample, or -1 if no data ready
+    const int32_t raw = i2sMic.read(); // full 32-bit sample, or -1 if no data ready
     if (raw == -1) continue;
-    const int scaled = raw >> MIC_SAMPLE_SHIFT;
-    sum += abs(scaled);
+    const int32_t scaled = raw >> MIC_SAMPLE_SHIFT;
+    sum += llabs((long long)scaled);
     collected++;
   }
   if (collected == 0) return 0;
-  return (int)(sum / collected);
+  return (int)(sum / (int64_t)collected);
 }
 
 float applySensitivity(float v) {
@@ -217,6 +226,15 @@ float applySensitivity(float v) {
   if (out < 0.0f) out = 0.0f;
   if (out > 1.0f) out = 1.0f;
   return out;
+}
+
+uint8_t pctToBrightness255(uint8_t pct) {
+  if (pct > MAX_BRIGHTNESS_PCT) pct = MAX_BRIGHTNESS_PCT;
+  return (uint8_t)((pct * 255) / 100);
+}
+
+void applyBrightnessFromState() {
+  FastLED.setBrightness(pctToBrightness255(state.brightnessPct));
 }
 
 CRGB colorForPixel(uint8_t index, uint8_t level255) {
@@ -241,8 +259,9 @@ CRGB colorForPixel(uint8_t index, uint8_t level255) {
 void renderStrip(CRGB* strip, float level) {
   const int onCount = (int)(level * NUM_LEDS_PER_STRIP + 0.5f);
   for (int i = 0; i < NUM_LEDS_PER_STRIP; i++) {
-    if (i < onCount) {
-      uint8_t ledLevel = (uint8_t)(120 + level * 135);
+      if (i < onCount) {
+      // Keep per-pixel value lower to avoid current spikes that can brownout ESP32.
+        uint8_t ledLevel = (uint8_t)(64 + level * 110);
       strip[i] = colorForPixel((uint8_t)i, ledLevel);
     } else {
       strip[i] = CRGB::Black;
@@ -289,17 +308,19 @@ void handleStateApi() {
 
 void handleBrightnessApi() {
   if (!server.hasArg("value")) {
-    server.send(400, "text/plain", "Thieu tham so value (0..255)");
+    server.send(400, "text/plain", "Thiếu tham số value (0..255)");
     return;
   }
   int v = server.arg("value").toInt();
   if (v < 0) v = 0;
-  if (v > 255) v = 255;
+  const int maxBrightness255 = (MAX_BRIGHTNESS_PCT * 255) / 100;
+  if (v > maxBrightness255) v = maxBrightness255;
   // Keep AppState in sync (it stores brightness as a 0..100 percentage).
   state.brightnessPct = (uint8_t)((v * 100 + 127) / 255);
   if (state.brightnessPct < 1) state.brightnessPct = 1;
-  FastLED.setBrightness((uint8_t)v);
-  server.send(200, "text/plain", "Do sang: " + String(v) + "/255");
+  if (state.brightnessPct > MAX_BRIGHTNESS_PCT) state.brightnessPct = MAX_BRIGHTNESS_PCT;
+  applyBrightnessFromState();
+  server.send(200, "text/plain", "Độ sáng: " + String(v) + "/255");
 }
 
 void handleStatusApi() {
@@ -329,7 +350,7 @@ void handleSetApi() {
   if (server.hasArg("brightness")) {
     int b = server.arg("brightness").toInt();
     if (b < 1) b = 1;
-    if (b > 100) b = 100;
+    if (b > MAX_BRIGHTNESS_PCT) b = MAX_BRIGHTNESS_PCT;
     state.brightnessPct = (uint8_t)b;
   }
   if (server.hasArg("sensitivity")) {
@@ -338,11 +359,16 @@ void handleSetApi() {
     if (s > 100) s = 100;
     state.sensitivityPct = (uint8_t)s;
   }
-  FastLED.setBrightness((uint8_t)((state.brightnessPct * 255) / 100));
+  applyBrightnessFromState();
   server.send(200, "text/plain", "Da cap nhat cai dat");
 }
 
 void updateLedsMusicReactive() {
+  const unsigned long upMs = millis() - bootStartMs;
+  if (upMs < BOOT_STABILIZE_MS) {
+    return;
+  }
+
   const unsigned long now = millis();
   if (now - lastFrameMs < 16) {
     return;
@@ -362,10 +388,18 @@ void updateLedsMusicReactive() {
 
   if (state.mode == MODE_SPLIT) {
     renderStrip(leds1, bassNorm);
-    renderStrip(leds2, trebleNorm);
+    if (upMs >= STRIP2_ENABLE_DELAY_MS) {
+      renderStrip(leds2, trebleNorm);
+    } else {
+      fill_solid(leds2, NUM_LEDS_PER_STRIP, CRGB::Black);
+    }
   } else {
     renderStrip(leds1, syncNorm);
-    renderStrip(leds2, syncNorm);
+    if (upMs >= STRIP2_ENABLE_DELAY_MS) {
+      renderStrip(leds2, syncNorm);
+    } else {
+      fill_solid(leds2, NUM_LEDS_PER_STRIP, CRGB::Black);
+    }
   }
 
   if (state.animateEffect) {
@@ -396,15 +430,20 @@ void setupTaskWatchdog() {
 
 void setup() {
   Serial.begin(115200);
+  bootStartMs = millis();
 
   WiFi.mode(WIFI_AP);
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);
 
   // INMP441 I2S microphone: standard mode, mono, left slot (L/R tied to GND).
   // Read as 32-bit because the INMP441 left-justifies 24 valid bits per frame.
   i2sMic.setPins(I2S_SCK_PIN, I2S_WS_PIN, -1 /*no DOUT*/, I2S_SD_PIN);
-  if (!i2sMic.begin(I2S_MODE_STD, I2S_SAMPLE_RATE, I2S_DATA_BIT_WIDTH_32BIT,
-                    I2S_SLOT_MODE_MONO, I2S_STD_SLOT_LEFT)) {
+  i2sReady = i2sMic.begin(I2S_MODE_STD, I2S_SAMPLE_RATE, I2S_DATA_BIT_WIDTH_32BIT,
+                          I2S_SLOT_MODE_MONO, I2S_STD_SLOT_LEFT);
+  if (!i2sReady) {
     Serial.println("Khoi tao I2S mic that bai!");
+  } else {
+    Serial.println("I2S mic san sang");
   }
 
   // Setting up an Access Point
@@ -431,8 +470,18 @@ void setup() {
   server.begin();
   FastLED.addLeds<WS2812B, DATA_PIN_LEF, GRB>(leds1, NUM_LEDS_PER_STRIP);
   FastLED.addLeds<WS2812B, DATA_PIN_RIG, GRB>(leds2, NUM_LEDS_PER_STRIP);
+  FastLED.setMaxPowerInVoltsAndMilliamps(LED_SUPPLY_VOLTS, LED_MAX_MILLIAMPS);
   FastLED.clear(true);
-  FastLED.setBrightness((uint8_t)((state.brightnessPct * 255) / 100));
+
+  // Soft-start brightness to reduce inrush current at boot.
+  FastLED.setBrightness(0);
+  FastLED.show();
+  for (uint8_t b = 0; b <= pctToBrightness255(state.brightnessPct); b += 4) {
+    FastLED.setBrightness(b);
+    FastLED.show();
+    delay(8);
+  }
+  applyBrightnessFromState();
 
   setupTaskWatchdog();
 
